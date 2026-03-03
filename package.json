@@ -1,0 +1,29 @@
+{
+  "name": "buskinaticket",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Infrastructure Digitale de Billetterie Routiere - Burkina Faso",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "test": "turbo test",
+    "lint": "turbo lint",
+    "db:generate": "pnpm --filter @buskinaticket/database db:generate",
+    "db:migrate": "pnpm --filter @buskinaticket/database db:migrate",
+    "db:seed": "pnpm --filter @buskinaticket/database db:seed"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "packageManager": "pnpm@10.29.3",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

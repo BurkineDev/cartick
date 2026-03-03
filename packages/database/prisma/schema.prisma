@@ -1,0 +1,406 @@
+// BuskinaTicket — Schema PostgreSQL Production
+// Version 2.0.0
+// Respect des contraintes d'intégrité d'inventaire (siège jamais vendu deux fois)
+
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto, uuid_ossp]
+}
+
+// ─── ENUMS ────────────────────────────────────────────────────────────────────
+
+enum SeatPolicy {
+  numbered  // Sièges numérotés individuels
+  free      // Sièges libres (compteur de places)
+  zone      // Sièges libres par zone (avant/arrière)
+}
+
+enum DepartureStatus {
+  open
+  boarding
+  departed
+  cancelled
+  completed
+}
+
+enum SeatType {
+  standard
+  vip
+  driver_adjacent
+}
+
+enum SeatStatus {
+  free
+  hold
+  paid
+  checked_in
+  boarded
+  cancelled
+  no_show
+}
+
+enum PassengerIdType {
+  cni
+  passport
+  permis
+}
+
+enum DeliveryMethod {
+  sms
+  whatsapp
+  print
+  app
+}
+
+enum DeliveryStatus {
+  pending
+  sent
+  failed
+}
+
+enum PaymentMode {
+  orange_money
+  moov_money
+  wave
+  cash
+  card
+}
+
+enum PaymentStatus {
+  pending
+  processing
+  paid
+  failed
+  expired
+  disputed
+  refunded
+}
+
+enum ReconciliationStatus {
+  open
+  closed
+  disputed
+}
+
+enum UserRole {
+  super_admin
+  company_admin
+  agent
+  scanner
+  client
+}
+
+enum SeatEventType {
+  SEAT_HELD
+  SEAT_RELEASED
+  PAYMENT_CONFIRMED
+  TICKET_BOARDED
+  HOLD_EXPIRED
+  TICKET_CANCELLED
+  TICKET_NO_SHOW
+}
+
+// ─── COMPANY ─────────────────────────────────────────────────────────────────
+
+model Company {
+  id                   String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                 String        @db.VarChar(200)
+  slug                 String        @unique @db.VarChar(100)
+  seat_policy          SeatPolicy    @default(numbered)
+  vip_enabled          Boolean       @default(false)
+  payment_methods      Json          @default("[]") // JSONB: liste des méthodes acceptées
+  commission_rate      Decimal       @default(0.0300) @db.Decimal(5, 4)
+  hold_timeout_minutes Int           @default(5)
+  timezone             String        @default("Africa/Ouagadougou") @db.VarChar(50)
+  contact_phone        String        @db.VarChar(20)
+  is_active            Boolean       @default(true)
+  created_at           DateTime      @default(now()) @db.Timestamptz
+  updated_at           DateTime      @updatedAt @db.Timestamptz
+
+  buses                Bus[]
+  routes               Route[]
+  users                User[]
+  departures           Departure[]   @relation("CompanyDepartures")
+  reconciliations      DailyReconciliation[]
+
+  @@map("companies")
+}
+
+// ─── BUS ─────────────────────────────────────────────────────────────────────
+
+model Bus {
+  id                  String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  company_id          String    @db.Uuid
+  registration_number String    @db.VarChar(20)
+  model               String    @db.VarChar(100)
+  capacity            Int
+  vip_seat_count      Int       @default(0)
+  seat_layout_json    Json      @default("{}") // JSONB: rangées, colonnes, allées
+  is_active           Boolean   @default(true)
+  created_at          DateTime  @default(now()) @db.Timestamptz
+  updated_at          DateTime  @updatedAt @db.Timestamptz
+
+  company             Company   @relation(fields: [company_id], references: [id])
+  departures          Departure[]
+
+  @@unique([company_id, registration_number])
+  @@map("buses")
+}
+
+// ─── CITY & ROUTE ────────────────────────────────────────────────────────────
+
+model City {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String   @db.VarChar(100)
+  code        String   @unique @db.VarChar(10) // ex: OUA, BBO
+  latitude    Decimal? @db.Decimal(10, 7)
+  longitude   Decimal? @db.Decimal(10, 7)
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.Timestamptz
+
+  origin_routes      Route[] @relation("OriginCity")
+  destination_routes Route[] @relation("DestinationCity")
+
+  @@map("cities")
+}
+
+model Route {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  company_id        String    @db.Uuid
+  origin_city_id    String    @db.Uuid
+  destination_city_id String  @db.Uuid
+  code              String    @db.VarChar(20) // ex: OUA-BBO
+  duration_minutes  Int
+  base_price        Decimal   @db.Decimal(10, 2) // Prix en XOF
+  vip_price         Decimal?  @db.Decimal(10, 2)
+  is_active         Boolean   @default(true)
+  created_at        DateTime  @default(now()) @db.Timestamptz
+  updated_at        DateTime  @updatedAt @db.Timestamptz
+
+  company           Company   @relation(fields: [company_id], references: [id])
+  origin_city       City      @relation("OriginCity", fields: [origin_city_id], references: [id])
+  destination_city  City      @relation("DestinationCity", fields: [destination_city_id], references: [id])
+  departures        Departure[]
+
+  @@unique([company_id, code])
+  @@map("routes")
+}
+
+// ─── DEPARTURE — Cœur du Système ─────────────────────────────────────────────
+
+model Departure {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  route_id           String          @db.Uuid
+  bus_id             String          @db.Uuid
+  company_id         String          @db.Uuid
+  departure_datetime DateTime        @db.Timestamptz
+  status             DepartureStatus @default(open)
+  available_seats    Int             // Cache mis à jour par trigger
+  seats_on_hold      Int             @default(0)
+  manifest_locked    Boolean         @default(false) // Vrai après départ
+  closed_by          String?         @db.Uuid
+  created_at         DateTime        @default(now()) @db.Timestamptz
+  updated_at         DateTime        @updatedAt @db.Timestamptz
+
+  route              Route           @relation(fields: [route_id], references: [id])
+  bus                Bus             @relation(fields: [bus_id], references: [id])
+  company            Company         @relation("CompanyDepartures", fields: [company_id], references: [id])
+  closed_by_user     User?           @relation("DepartureClosure", fields: [closed_by], references: [id])
+  seats              Seat[]
+
+  @@index([departure_datetime])
+  @@index([company_id, status])
+  @@index([route_id, departure_datetime])
+  @@map("departures")
+}
+
+// ─── SEAT — Le Verrou Central ─────────────────────────────────────────────────
+
+model Seat {
+  id               String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  departure_id     String     @db.Uuid
+  seat_number      String     @db.VarChar(10) // ex: "12A", "VIP-3"
+  seat_type        SeatType   @default(standard)
+  status           SeatStatus @default(free)
+  hold_session_id  String?    @db.Uuid
+  hold_expires_at  DateTime?  @db.Timestamptz // Index pour le job de nettoyage
+  price            Decimal?   @db.Decimal(10, 2) // Prix en XOF au moment de la vente
+  sold_by          String?    @db.Uuid // Agent vendeur si vente cash
+  updated_at       DateTime   @updatedAt @db.Timestamptz
+  version          Int        @default(0) // Optimistic locking — incrémenté à chaque update
+
+  departure        Departure  @relation(fields: [departure_id], references: [id])
+  sold_by_user     User?      @relation("SeatSeller", fields: [sold_by], references: [id])
+  ticket           Ticket?
+  events           SeatEvent[]
+
+  @@unique([departure_id, seat_number])
+  @@index([departure_id, status])
+  @@index([hold_expires_at]) // Pour le job de nettoyage des holds expirés
+  @@map("seats")
+}
+
+// ─── SEAT EVENT — Audit Immuable ─────────────────────────────────────────────
+
+model SeatEvent {
+  id         String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seat_id    String        @db.Uuid
+  event      SeatEventType
+  data       Json          // Payload complet de l'événement
+  created_at DateTime      @default(now()) @db.Timestamptz
+
+  seat       Seat          @relation(fields: [seat_id], references: [id])
+
+  // INSERT-only: pas de UPDATE ni DELETE autorisés
+  @@index([seat_id, created_at])
+  @@map("seat_events")
+}
+
+// ─── USER ────────────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  company_id    String?   @db.Uuid // Null pour super_admin
+  email         String    @unique @db.VarChar(255)
+  phone         String?   @db.VarChar(20) // Format international +226XXXXXXXX
+  phone_hash    String?   @db.VarChar(64) // SHA-256 pour recherche (RGPD)
+  password_hash String    @db.VarChar(255) // bcrypt
+  role          UserRole  @default(client)
+  first_name    String    @db.VarChar(100)
+  last_name     String    @db.VarChar(100)
+  is_active     Boolean   @default(true)
+  last_login_at DateTime? @db.Timestamptz
+  created_at    DateTime  @default(now()) @db.Timestamptz
+  updated_at    DateTime  @updatedAt @db.Timestamptz
+
+  company       Company?  @relation(fields: [company_id], references: [id])
+
+  refresh_tokens     RefreshToken[]
+  seats_sold         Seat[]         @relation("SeatSeller")
+  departures_closed  Departure[]    @relation("DepartureClosure")
+  reconciliations_closed DailyReconciliation[] @relation("ReconciliationCloser")
+  audit_logs         AuditLog[]
+
+  @@index([company_id, role])
+  @@map("users")
+}
+
+// ─── REFRESH TOKEN ────────────────────────────────────────────────────────────
+
+model RefreshToken {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id     String    @db.Uuid
+  token_hash  String    @unique @db.VarChar(64) // SHA-256 du token
+  device_id   String?   @db.VarChar(100)
+  ip_address  String?   @db.VarChar(45)
+  expires_at  DateTime  @db.Timestamptz
+  revoked_at  DateTime? @db.Timestamptz // Null = actif
+  created_at  DateTime  @default(now()) @db.Timestamptz
+
+  user        User      @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@index([expires_at])
+  @@map("refresh_tokens")
+}
+
+// ─── TICKET ───────────────────────────────────────────────────────────────────
+
+model Ticket {
+  id                   String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seat_id              String          @unique @db.Uuid
+  passenger_name       String          @db.VarChar(200)
+  passenger_phone_hash String          @db.VarChar(64) // SHA-256 (RGPD)
+  passenger_id_type    PassengerIdType?
+  passenger_id_number  String?         @db.VarChar(50)
+  qr_code              String          // Contenu JWT signé
+  qr_signature         String          // Signature ECDSA P-256
+  delivery_method      DeliveryMethod
+  delivery_status      DeliveryStatus  @default(pending)
+  issued_at            DateTime        @default(now()) @db.Timestamptz
+  invalidated_at       DateTime?       @db.Timestamptz // Si annulé post-émission
+
+  seat                 Seat            @relation(fields: [seat_id], references: [id])
+  transaction          Transaction?
+
+  @@index([issued_at])
+  @@map("tickets")
+}
+
+// ─── TRANSACTION ──────────────────────────────────────────────────────────────
+
+model Transaction {
+  id                   String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  idempotency_key      String        @unique @db.VarChar(100) // Clé unique côté client
+  ticket_id            String        @unique @db.Uuid
+  payment_mode         PaymentMode
+  payment_status       PaymentStatus @default(pending)
+  amount               Decimal       @db.Decimal(10, 2) // Montant en XOF
+  platform_fee         Decimal       @default(0) @db.Decimal(10, 2)
+  operator_ref         String?       @db.VarChar(100) // Référence côté opérateur Mobile Money
+  webhook_received_at  DateTime?     @db.Timestamptz
+  agent_id             String?       @db.Uuid // Vendeur si paiement cash
+  reconciled           Boolean       @default(false)
+  reconciliation_date  DateTime?     @db.Date
+  created_at           DateTime      @default(now()) @db.Timestamptz
+  updated_at           DateTime      @updatedAt @db.Timestamptz
+
+  ticket               Ticket        @relation(fields: [ticket_id], references: [id])
+
+  @@index([payment_status])
+  @@index([reconciled, reconciliation_date])
+  @@index([operator_ref])
+  @@map("transactions")
+}
+
+// ─── DAILY RECONCILIATION — Clôture Comptable Formelle ───────────────────────
+
+model DailyReconciliation {
+  id                    String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  company_id            String               @db.Uuid
+  closing_date          DateTime             @db.Date
+  status                ReconciliationStatus @default(open)
+  total_digital_sales   Decimal              @default(0) @db.Decimal(12, 2)
+  total_cash_sales      Decimal              @default(0) @db.Decimal(12, 2)
+  total_platform_fees   Decimal              @default(0) @db.Decimal(12, 2)
+  total_tickets_issued  Int                  @default(0)
+  total_boarded         Int                  @default(0)
+  disputed_amount       Decimal              @default(0) @db.Decimal(12, 2)
+  closed_by             String?              @db.Uuid
+  closed_at             DateTime?            @db.Timestamptz
+  notes                 String?
+
+  company               Company              @relation(fields: [company_id], references: [id])
+  closed_by_user        User?                @relation("ReconciliationCloser", fields: [closed_by], references: [id])
+
+  @@unique([company_id, closing_date])
+  @@map("daily_reconciliations")
+}
+
+// ─── AUDIT LOG — Immuable ────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id     String?  @db.Uuid
+  action      String   @db.VarChar(100)
+  resource    String   @db.VarChar(100)
+  resource_id String?  @db.Uuid
+  data        Json?    // Payload de l'action
+  ip_address  String?  @db.VarChar(45)
+  user_agent  String?  @db.VarChar(500)
+  created_at  DateTime @default(now()) @db.Timestamptz
+
+  user        User?    @relation(fields: [user_id], references: [id])
+
+  // INSERT-only: pas d'UPDATE ni DELETE — logs immuables
+  @@index([user_id, created_at])
+  @@index([resource, resource_id])
+  @@index([created_at])
+  @@map("audit_logs")
+}
