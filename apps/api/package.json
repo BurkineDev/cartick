@@ -30,7 +30,7 @@
     "dotenv": "^16.4.0",
     "pino": "^9.5.0",
     "pino-pretty": "^13.0.0",
-    "uuid": "^11.0.0",
+    "uuid": "^14.0.0",
     "date-fns": "^4.1.0",
     "date-fns-tz": "^3.2.0",
     "fastify-plugin": "^5.0.0"
